@@ -21,7 +21,7 @@ from modules.export import export_clean_data, export_full_report, generate_filen
 from modules.review import (
     generate_review_tasks, filter_review_tasks,
     compute_review_statistics, update_task_status,
-    batch_update_status, REVIEW_STATUS_OPTIONS
+    batch_update_status, REVIEW_STATUS_OPTIONS, merge_review_tasks
 )
 
 st.set_page_config(
@@ -244,7 +244,7 @@ def _plot_review_status_distribution(stats: dict):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _render_review_task_detail(row: pd.Series, original_df: pd.DataFrame):
+def _render_review_task_detail(row: pd.Series, original_df: pd.DataFrame, raw_df: pd.DataFrame = None):
     priority_color = {"高": "🔴", "中": "🟡", "低": "🟢"}
     status_color = {"待复核": "⏳", "已确认": "✅", "已忽略": "ℹ️"}
 
@@ -268,11 +268,22 @@ def _render_review_task_detail(row: pd.Series, original_df: pd.DataFrame):
     st.markdown(f"**💡 处理建议：** {row['suggestion']}")
 
     if pd.notna(row['original_index']) and 0 <= int(row['original_index']) < len(original_df):
-        with st.expander("📝 查看关联原始记录", expanded=False):
-            original_row = original_df.iloc[int(row['original_index'])]
-            display_cols = [c for c in REQUIRED_FIELDS.keys() if c in original_row.index]
-            original_display = pd.DataFrame([original_row[display_cols].to_dict()])
-            st.dataframe(original_display, use_container_width=True, hide_index=True)
+        with st.expander("📝 查看关联原始记录（上传的原始数据", expanded=False):
+            if raw_df is not None and not raw_df.empty:
+                orig_idx = int(row['original_index'])
+                if orig_idx < len(raw_df):
+                    original_row = raw_df.iloc[orig_idx]
+                    original_display = pd.DataFrame([original_row.to_dict()])
+                    st.markdown("**原始上传数据：**")
+                    st.dataframe(original_display, use_container_width=True, hide_index=True)
+                else:
+                    st.info("原始数据行数少于清洗后数据行数（可能因去重导致）。")
+            else:
+                original_row = original_df.iloc[int(row['original_index'])]
+                display_cols = [c for c in REQUIRED_FIELDS.keys() if c in original_row.index]
+                original_display = pd.DataFrame([original_row[display_cols].to_dict()])
+                st.info("未找到原始上传数据，显示清洗后数据：")
+                st.dataframe(original_display, use_container_width=True, hide_index=True)
 
     if row['review_note']:
         with st.expander("📋 查看复核备注历史", expanded=False):
@@ -394,7 +405,9 @@ def main():
     st.session_state["cleaned_df"] = cleaned_df
 
     try:
-        review_tasks = generate_review_tasks(cleaned_df)
+        new_review_tasks = generate_review_tasks(cleaned_df)
+        existing_tasks = st.session_state.get("review_tasks")
+        review_tasks = merge_review_tasks(new_review_tasks, existing_tasks)
         st.session_state["review_tasks"] = review_tasks
     except Exception as e:
         st.warning(f"复核任务生成异常：{str(e)}，跳过复核模块。")
@@ -508,10 +521,6 @@ def main():
         st.info("📭 当前没有需要复核的任务。")
     else:
         try:
-            review_stats = compute_review_statistics(review_tasks_all)
-            _render_review_metric_cards(review_stats)
-
-            st.divider()
             st.markdown("#### 🎛️ 复核任务筛选")
             rfc = st.columns(6)
             r_date_range = rfc[0].date_input(
@@ -537,6 +546,9 @@ def main():
 
             review_filtered = filter_review_tasks(review_tasks_all, review_filters)
             st.session_state["review_filtered"] = review_filtered
+
+            review_stats = compute_review_statistics(review_filtered)
+            _render_review_metric_cards(review_stats)
 
             row_review = st.columns(2)
             with row_review[0]:
@@ -625,8 +637,9 @@ def main():
             if review_filtered.empty:
                 st.info("当前筛选条件下没有复核任务。")
             else:
+                raw_df = st.session_state.get("raw_uploaded")
                 for _, row in review_filtered.iterrows():
-                    _render_review_task_detail(row, df)
+                    _render_review_task_detail(row, df, raw_df)
 
                     with st.container():
                         action_cols = st.columns([2, 3, 1, 1, 1])

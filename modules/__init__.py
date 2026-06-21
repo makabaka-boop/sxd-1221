@@ -10,7 +10,7 @@ from modules.export import export_clean_data, export_full_report, generate_filen
 from modules.review import (
     generate_review_tasks, filter_review_tasks,
     compute_review_statistics, update_task_status,
-    batch_update_status, REVIEW_STATUS_OPTIONS
+    batch_update_status, REVIEW_STATUS_OPTIONS, merge_review_tasks
 )
 
 __all__ = [
@@ -23,5 +23,5 @@ __all__ = [
     "export_clean_data", "export_full_report", "generate_filename",
     "generate_review_tasks", "filter_review_tasks",
     "compute_review_statistics", "update_task_status",
-    "batch_update_status", "REVIEW_STATUS_OPTIONS",
+    "batch_update_status", "REVIEW_STATUS_OPTIONS", "merge_review_tasks",
 ]

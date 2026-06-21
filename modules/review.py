@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import uuid
+import hashlib
 
 
 REVIEW_STATUS_OPTIONS = ["待复核", "已确认", "已忽略"]
@@ -12,6 +13,53 @@ DEFAULT_RESPONSE_THRESHOLD = 300
 
 def _generate_task_id() -> str:
     return f"RT{datetime.now().strftime('%Y%m%d')}_{str(uuid.uuid4())[:8].upper()}"
+
+
+def _generate_stable_id(row: pd.Series) -> str:
+    key_parts = [
+        str(row.get("record_date", "")),
+        str(row.get("channel_name", "")),
+        str(row.get("agent_name", "")),
+        str(row.get("response_seconds", "")),
+        str(row.get("score", "")),
+        str(row.get("issue_type", "")),
+        str(row.get("solved_flag", "")),
+        str(row.get("note", ""))
+    ]
+    key = "|".join(key_parts)
+    return hashlib.md5(key.encode("utf-8")).hexdigest()[:16].upper()
+
+
+def merge_review_tasks(new_tasks: pd.DataFrame, old_tasks: pd.DataFrame) -> pd.DataFrame:
+    if old_tasks is None or old_tasks.empty:
+        return new_tasks
+    if new_tasks is None or new_tasks.empty:
+        return old_tasks
+
+    result = new_tasks.copy()
+
+    if "stable_id" not in old_tasks.columns or "stable_id" not in new_tasks.columns:
+        return result
+
+    old_status_map = {}
+    for _, old_row in old_tasks.iterrows():
+        sid = old_row.get("stable_id")
+        if pd.notna(sid) and old_row.get("status") != "待复核":
+            old_status_map[sid] = {
+                "status": old_row["status"],
+                "review_note": old_row.get("review_note", ""),
+                "task_id": old_row["task_id"]
+            }
+
+    for idx, new_row in result.iterrows():
+        sid = new_row.get("stable_id")
+        if pd.notna(sid) and sid in old_status_map:
+            old_data = old_status_map[sid]
+            result.loc[idx, "status"] = old_data["status"]
+            result.loc[idx, "review_note"] = old_data["review_note"]
+            result.loc[idx, "task_id"] = old_data["task_id"]
+
+    return result
 
 
 def _determine_priority(review_reason: str, score: float, response_seconds: float, solved: bool) -> str:
@@ -75,7 +123,7 @@ def generate_review_tasks(df: pd.DataFrame,
                           response_threshold: int = DEFAULT_RESPONSE_THRESHOLD) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=[
-            "task_id", "record_date", "channel_name", "agent_name",
+            "task_id", "stable_id", "record_date", "channel_name", "agent_name",
             "issue_type", "score", "response_seconds", "solved_flag",
             "review_reason", "priority", "status", "review_note",
             "suggestion", "original_index"
@@ -92,7 +140,7 @@ def generate_review_tasks(df: pd.DataFrame,
 
     if not mask.any():
         return pd.DataFrame(columns=[
-            "task_id", "record_date", "channel_name", "agent_name",
+            "task_id", "stable_id", "record_date", "channel_name", "agent_name",
             "issue_type", "score", "response_seconds", "solved_flag",
             "review_reason", "priority", "status", "review_note",
             "suggestion", "original_index"
@@ -100,6 +148,8 @@ def generate_review_tasks(df: pd.DataFrame,
 
     result = df[mask].copy()
     result["original_index"] = result.index
+
+    result["stable_id"] = result.apply(_generate_stable_id, axis=1)
 
     result["review_reason"] = ""
     result.loc[(numeric_score < low_score_threshold)[mask], "review_reason"] += "低分;"
@@ -122,7 +172,7 @@ def generate_review_tasks(df: pd.DataFrame,
     )
 
     output_columns = [
-        "task_id", "record_date", "channel_name", "agent_name",
+        "task_id", "stable_id", "record_date", "channel_name", "agent_name",
         "issue_type", "score", "response_seconds", "solved_flag",
         "review_reason", "priority", "status", "review_note",
         "suggestion", "original_index"
