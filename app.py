@@ -10,7 +10,7 @@ from plotly.subplots import make_subplots
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from modules.cleaning import clean_dataframe, REQUIRED_FIELDS
-from modules.validation import run_all_validations
+from modules.validation import run_all_validations, validate_raw_data, FIELD_LABELS
 from modules.aggregation import (
     filter_dataframe, compute_overall_metrics,
     groupby_low_score_distribution, groupby_agent_load,
@@ -176,7 +176,7 @@ def _plot_channel_trend(df_plot: pd.DataFrame):
 
 
 def _render_suggestions(suggestions: list):
-    st.subheader("🎯 质检建议（近 30 天）")
+    st.subheader("🎯 质检建议（基于当前筛选数据，近 30 天）")
     if not suggestions:
         st.success("✅ 近 30 天整体表现良好，暂无需要特别重点复核的对象。")
         return
@@ -272,6 +272,27 @@ def main():
         submitted = st.form_submit_button("✅ 确认映射并开始清洗", type="primary", use_container_width=True)
 
     try:
+        mapped_df = raw_df.rename(columns={v: k for k, v in user_mapping.items() if v}).copy()
+        raw_validation = validate_raw_data(mapped_df)
+    except Exception as e:
+        st.error(f"原始数据预校验失败：{str(e)}")
+        with st.expander("🔍 技术详情（仅供调试）"):
+            st.code(traceback.format_exc())
+        raw_validation = {"total_rows": len(raw_df), "issue_count": 0, "issues": []}
+
+    with st.expander("🔍 原始数据预校验（清洗前，准确定位问题行）", expanded=True):
+        if raw_validation["issue_count"] == 0:
+            st.success("✅ 原始数据格式检查通过，未发现明显问题。")
+        else:
+            st.warning(f"⚠️ 发现 {raw_validation['issue_count']} 类数据质量问题，共 {raw_validation['total_rows']} 行记录：")
+            for issue in raw_validation["issues"]:
+                icon = "❌" if issue["level"] == "error" else "⚠️"
+                with st.expander(f"{icon} {issue['title']}", expanded=(issue["level"] == "error")):
+                    if not issue["detail_df"].empty:
+                        st.dataframe(issue["detail_df"], use_container_width=True, hide_index=True)
+                    st.caption(f"💡 {issue['tip']}")
+
+    try:
         cleaned_df, clean_report = clean_dataframe(raw_df, user_mapping)
     except Exception as e:
         st.error(f"数据清洗过程出现异常：{str(e)}")
@@ -284,13 +305,13 @@ def main():
     try:
         validations = run_all_validations(cleaned_df)
     except Exception as e:
-        st.warning(f"校验模块执行异常：{str(e)}，跳过校验提示。")
+        st.warning(f"清洗后校验模块执行异常：{str(e)}，跳过校验提示。")
         validations = {"missing_fields": [], "duplicates": {"duplicate_count": 0},
                        "response_anomalies": {"anomaly_count": 0},
                        "score_format": {"invalid_count": 0, "out_of_range": 0},
                        "numeric_errors": {}}
 
-    with st.expander("🔍 数据校验结果（点击展开/收起）", expanded=True):
+    with st.expander("🧹 清洗后数据校验结果（点击展开/收起）", expanded=False):
         _display_validation_banners(validations)
         with st.expander("📝 清洗详细报告"):
             cr_cols = st.columns(len(clean_report))
@@ -342,7 +363,7 @@ def main():
     agent_load = groupby_agent_load(filtered)
     channel_trend = groupby_channel_trend(filtered)
     pending_review = get_pending_review_details(filtered)
-    suggestions = generate_quality_suggestions(df)
+    suggestions = generate_quality_suggestions(filtered)
 
     st.divider()
     st.subheader("📊 核心指标概览")

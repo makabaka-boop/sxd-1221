@@ -30,7 +30,7 @@ def _parse_numeric(val):
         return float(val)
     s = str(val).strip()
     s = re.sub(r"[,%\s]", "", s)
-    s = s.replace("分", "").replace("秒", "")
+    s = s.replace("分", "").replace("秒", "").replace("s", "").replace("S", "")
     try:
         return float(s)
     except (ValueError, TypeError):
