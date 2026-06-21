@@ -18,6 +18,11 @@ from modules.aggregation import (
 )
 from modules.suggestions import generate_quality_suggestions
 from modules.export import export_clean_data, export_full_report, generate_filename
+from modules.review import (
+    generate_review_tasks, filter_review_tasks,
+    compute_review_statistics, update_task_status,
+    batch_update_status, REVIEW_STATUS_OPTIONS
+)
 
 st.set_page_config(
     page_title="客服响应质量分析看板",
@@ -194,6 +199,88 @@ def _render_suggestions(suggestions: list):
                 st.markdown(f"**建议动作：** {s['action']}")
 
 
+def _render_review_metric_cards(stats: dict):
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("📋 复核任务总数", f"{stats['total_tasks']:,}")
+    c2.metric("⏳ 待复核", f"{stats['pending_count']} 条",
+             delta="待处理" if stats['pending_count'] > 0 else "全部处理")
+    c3.metric("✅ 已确认", f"{stats['confirmed_count']} 条")
+    c4.metric("ℹ️ 已忽略", f"{stats['ignored_count']} 条")
+    c5.metric("🔴 高优先级", f"{stats['high_priority_count']} 条",
+             delta="需紧急处理" if stats['high_priority_count'] > 0 else "")
+    completion = stats['completion_rate']
+    c6.metric("📊 完成率", f"{completion:.2f} %",
+             delta="优秀" if completion >= 80 else ("良好" if completion >= 50 else "待提升"))
+
+
+def _plot_review_priority_distribution(stats: dict):
+    if stats["by_priority"].empty:
+        st.info("暂无优先级分布数据。")
+        return
+    color_map = {"高": "#E45756", "中": "#F2B701", "低": "#4C78A8"}
+    fig = px.pie(
+        stats["by_priority"], values="count", names="priority",
+        title="📊 复核任务优先级分布",
+        color="priority", color_discrete_map=color_map,
+        hole=0.4
+    )
+    fig.update_traces(textinfo="label+percent+value")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _plot_review_status_distribution(stats: dict):
+    if stats["by_status"].empty:
+        st.info("暂无状态分布数据。")
+        return
+    color_map = {"待复核": "#FFA15A", "已确认": "#72B7B2", "已忽略": "#BAB0AC"}
+    fig = px.bar(
+        stats["by_status"], x="status", y="count",
+        title="📊 复核任务状态分布",
+        labels={"status": "状态", "count": "数量"},
+        color="status", color_discrete_map=color_map,
+        text="count"
+    )
+    fig.update_layout(xaxis_tickangle=0)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_review_task_detail(row: pd.Series, original_df: pd.DataFrame):
+    priority_color = {"高": "🔴", "中": "🟡", "低": "🟢"}
+    status_color = {"待复核": "⏳", "已确认": "✅", "已忽略": "ℹ️"}
+
+    st.markdown(f"### {priority_color.get(row['priority'], '⚪')} 任务 {row['task_id']} "
+                f"（{row['priority']}优先级） "
+                f"{status_color.get(row['status'], '')} {row['status']}")
+
+    info_cols = st.columns(4)
+    info_cols[0].markdown(f"**坐席：** {row['agent_name']}")
+    info_cols[1].markdown(f"**渠道：** {row['channel_name']}")
+    info_cols[2].markdown(f"**问题类型：** {row['issue_type']}")
+    info_cols[3].markdown(f"**日期：** {row['record_date']}")
+
+    info_cols2 = st.columns(4)
+    info_cols2[0].markdown(f"**质检分数：** {row['score']:.0f} 分" if pd.notna(row['score']) else "**质检分数：** 无")
+    info_cols2[1].markdown(f"**响应时长：** {row['response_seconds']:.0f} 秒" if pd.notna(row['response_seconds']) else "**响应时长：** 无")
+    solved_text = "是" if row['solved_flag'] == True else ("否" if row['solved_flag'] == False else "未知")
+    info_cols2[2].markdown(f"**是否解决：** {solved_text}")
+    info_cols2[3].markdown(f"**复核原因：** {row['review_reason']}")
+
+    st.markdown(f"**💡 处理建议：** {row['suggestion']}")
+
+    if pd.notna(row['original_index']) and 0 <= int(row['original_index']) < len(original_df):
+        with st.expander("📝 查看关联原始记录", expanded=False):
+            original_row = original_df.iloc[int(row['original_index'])]
+            display_cols = [c for c in REQUIRED_FIELDS.keys() if c in original_row.index]
+            original_display = pd.DataFrame([original_row[display_cols].to_dict()])
+            st.dataframe(original_display, use_container_width=True, hide_index=True)
+
+    if row['review_note']:
+        with st.expander("📋 查看复核备注历史", expanded=False):
+            st.text(row['review_note'])
+
+    st.divider()
+
+
 def main():
     st.title("📞 客服响应质量分析看板")
     st.caption("通话记录 / 在线会话记录 / 质检结果一站式分析，无需登录，即传即用")
@@ -202,6 +289,10 @@ def main():
         st.session_state["cleaned_df"] = None
     if "raw_uploaded" not in st.session_state:
         st.session_state["raw_uploaded"] = None
+    if "review_tasks" not in st.session_state:
+        st.session_state["review_tasks"] = None
+    if "review_filtered" not in st.session_state:
+        st.session_state["review_filtered"] = None
 
     with st.sidebar:
         st.header("📂 数据上传")
@@ -301,6 +392,13 @@ def main():
         return
 
     st.session_state["cleaned_df"] = cleaned_df
+
+    try:
+        review_tasks = generate_review_tasks(cleaned_df)
+        st.session_state["review_tasks"] = review_tasks
+    except Exception as e:
+        st.warning(f"复核任务生成异常：{str(e)}，跳过复核模块。")
+        st.session_state["review_tasks"] = None
 
     try:
         validations = run_all_validations(cleaned_df)
@@ -404,7 +502,165 @@ def main():
     _render_suggestions(suggestions)
 
     st.divider()
-    st.subheader("📥 导出报告")
+    st.subheader("� 质检复核任务闭环")
+    review_tasks_all = st.session_state.get("review_tasks")
+    if review_tasks_all is None or review_tasks_all.empty:
+        st.info("📭 当前没有需要复核的任务。")
+    else:
+        try:
+            review_stats = compute_review_statistics(review_tasks_all)
+            _render_review_metric_cards(review_stats)
+
+            st.divider()
+            st.markdown("#### 🎛️ 复核任务筛选")
+            rfc = st.columns(6)
+            r_date_range = rfc[0].date_input(
+                "日期范围",
+                value=(review_tasks_all["record_date"].min().date() if review_tasks_all["record_date"].notna().any() else None,
+                       review_tasks_all["record_date"].max().date() if review_tasks_all["record_date"].notna().any() else None),
+                key="review_filter_date"
+            )
+            r_channels = rfc[1].multiselect("渠道", sorted(review_tasks_all["channel_name"].dropna().unique().tolist()), key="review_filter_chan")
+            r_agents = rfc[2].multiselect("坐席", sorted(review_tasks_all["agent_name"].dropna().unique().tolist()), key="review_filter_agent")
+            r_issue_types = rfc[3].multiselect("问题类型", sorted(review_tasks_all["issue_type"].dropna().unique().tolist()), key="review_filter_issue")
+            r_priorities = rfc[4].multiselect("优先级", ["高", "中", "低"], default=[], key="review_filter_priority")
+            r_statuses = rfc[5].multiselect("复核状态", REVIEW_STATUS_OPTIONS, default=[], key="review_filter_status")
+
+            review_filters = {
+                "date_range": r_date_range if all(r_date_range) else None,
+                "channels": r_channels,
+                "agents": r_agents,
+                "issue_types": r_issue_types,
+                "priorities": r_priorities,
+                "statuses": r_statuses
+            }
+
+            review_filtered = filter_review_tasks(review_tasks_all, review_filters)
+            st.session_state["review_filtered"] = review_filtered
+
+            row_review = st.columns(2)
+            with row_review[0]:
+                try:
+                    _plot_review_priority_distribution(review_stats)
+                except Exception as e:
+                    st.error(f"优先级分布图渲染失败：{str(e)}")
+            with row_review[1]:
+                try:
+                    _plot_review_status_distribution(review_stats)
+                except Exception as e:
+                    st.error(f"状态分布图渲染失败：{str(e)}")
+
+            with st.expander("📊 按坐席统计", expanded=False):
+                if not review_stats["by_agent"].empty:
+                    st.dataframe(review_stats["by_agent"], use_container_width=True, hide_index=True)
+                else:
+                    st.info("暂无数据")
+
+            with st.expander("📊 按渠道统计", expanded=False):
+                if not review_stats["by_channel"].empty:
+                    st.dataframe(review_stats["by_channel"], use_container_width=True, hide_index=True)
+                else:
+                    st.info("暂无数据")
+
+            with st.expander("📊 按问题类型统计", expanded=False):
+                if not review_stats["by_issue_type"].empty:
+                    st.dataframe(review_stats["by_issue_type"], use_container_width=True, hide_index=True)
+                else:
+                    st.info("暂无数据")
+
+            st.divider()
+            st.markdown("#### 📋 复核任务列表")
+
+            batch_cols = st.columns([2, 2, 2, 1, 3])
+            batch_status = batch_cols[0].selectbox("批量更新状态", REVIEW_STATUS_OPTIONS, key="batch_status")
+            batch_note = batch_cols[1].text_input("批量备注（可选）", key="batch_note", placeholder="填写复核备注...")
+            batch_selected = []
+
+            display_tasks = review_filtered.copy()
+            if not display_tasks.empty:
+                display_tasks["_select"] = False
+                display_tasks["_priority_order"] = display_tasks["priority"].map({"高": 0, "中": 1, "低": 2})
+                display_tasks = display_tasks.sort_values(by=["_priority_order", "record_date"]).drop(columns=["_priority_order"])
+
+                table_cols = ["_select", "task_id", "priority", "status", "agent_name", "channel_name",
+                              "issue_type", "score", "response_seconds", "review_reason"]
+                editable_df = display_tasks[table_cols].copy()
+                editable_df.columns = ["选择", "任务ID", "优先级", "状态", "坐席", "渠道",
+                                       "问题类型", "分数", "响应时长(秒)", "复核原因"]
+
+                edited = st.data_editor(
+                    editable_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "选择": st.column_config.CheckboxColumn("选择", default=False),
+                        "任务ID": st.column_config.TextColumn("任务ID", disabled=True),
+                        "优先级": st.column_config.TextColumn("优先级", disabled=True),
+                        "状态": st.column_config.TextColumn("状态", disabled=True),
+                        "坐席": st.column_config.TextColumn("坐席", disabled=True),
+                        "渠道": st.column_config.TextColumn("渠道", disabled=True),
+                        "问题类型": st.column_config.TextColumn("问题类型", disabled=True),
+                        "分数": st.column_config.NumberColumn("分数", disabled=True),
+                        "响应时长(秒)": st.column_config.NumberColumn("响应时长(秒)", disabled=True),
+                        "复核原因": st.column_config.TextColumn("复核原因", disabled=True),
+                    },
+                    key="review_task_table"
+                )
+
+                batch_selected = edited[edited["选择"] == True]["任务ID"].tolist()
+
+                batch_cols[2].markdown("<br>", unsafe_allow_html=True)
+                if batch_cols[2].button(f"📦 批量更新 ({len(batch_selected)} 条)",
+                                         type="primary", disabled=(len(batch_selected) == 0),
+                                         key="batch_update_btn", use_container_width=True):
+                    st.session_state["review_tasks"] = batch_update_status(
+                        st.session_state["review_tasks"], batch_selected, batch_status, batch_note
+                    )
+                    st.success(f"✅ 已批量更新 {len(batch_selected)} 条任务状态为「{batch_status}」")
+                    st.rerun()
+
+            st.divider()
+            st.markdown("#### 🔍 任务详情与单条复核")
+
+            if review_filtered.empty:
+                st.info("当前筛选条件下没有复核任务。")
+            else:
+                for _, row in review_filtered.iterrows():
+                    _render_review_task_detail(row, df)
+
+                    with st.container():
+                        action_cols = st.columns([2, 3, 1, 1, 1])
+                        new_status = action_cols[0].selectbox(
+                            "更新状态",
+                            REVIEW_STATUS_OPTIONS,
+                            index=REVIEW_STATUS_OPTIONS.index(row["status"]) if row["status"] in REVIEW_STATUS_OPTIONS else 0,
+                            key=f"status_{row['task_id']}"
+                        )
+                        new_note = action_cols[1].text_input(
+                            "复核备注",
+                            placeholder="填写复核意见...",
+                            key=f"note_{row['task_id']}"
+                        )
+                        action_cols[2].markdown("<br>", unsafe_allow_html=True)
+                        if action_cols[2].button(
+                            "💾 保存",
+                            key=f"save_{row['task_id']}",
+                            type="primary",
+                            use_container_width=True
+                        ):
+                            st.session_state["review_tasks"] = update_task_status(
+                                st.session_state["review_tasks"], row["task_id"], new_status, new_note
+                            )
+                            st.success(f"✅ 任务 {row['task_id']} 状态已更新为「{new_status}」")
+                            st.rerun()
+
+        except Exception as e:
+            st.error(f"复核任务模块渲染失败：{str(e)}")
+            with st.expander("🔍 技术详情"):
+                st.code(traceback.format_exc())
+
+    st.divider()
+    st.subheader("�📥 导出报告")
     exp_cols = st.columns(3)
     try:
         clean_bytes = export_clean_data(filtered)
@@ -418,8 +674,14 @@ def main():
         exp_cols[0].error(f"导出清洗数据失败：{str(e)}")
 
     try:
+        final_review_tasks = st.session_state.get("review_tasks")
+        final_review_stats = None
+        if final_review_tasks is not None and not final_review_tasks.empty:
+            final_review_stats = compute_review_statistics(final_review_tasks)
+
         report_bytes = export_full_report(filtered, metrics, agent_load,
-                                          channel_trend, pending_review, suggestions)
+                                          channel_trend, pending_review, suggestions,
+                                          final_review_tasks, final_review_stats)
         exp_cols[1].download_button(
             "下载完整分析报告 (Excel)",
             data=report_bytes,
